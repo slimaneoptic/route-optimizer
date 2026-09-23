@@ -1,31 +1,39 @@
-"""Vehicle routing (capacities + time windows + shift length) on Google OR-Tools.
+"""Vehicle routing (capacities + time windows + shift length) on Google OR-Tools, optimized for cost.
 
-Pure functions, no UI: load stops, build matrices, solve, and a greedy baseline
-that mimics quick manual planning ("always drive to the nearest next customer").
+Pure functions, no UI: load stops, build matrices, solve, a fleet-size sweep, and a greedy
+baseline that mimics quick manual planning ("always drive to the nearest next customer").
+Costs: every km costs `cost_per_km`, every van used costs `cost_per_van` per day, so the solver
+itself decides whether one more van pays off.
 """
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-ROAD_FACTOR = 1.3  # straight-line km -> approximate road km in a city
-DROP_PENALTY_M = 1_000_000  # cost of leaving a stop unserved (only when infeasible)
+from roads import Matrices
+
+ROAD_FACTOR = 1.3  # straight-line km -> approximate road km, only when road data is unavailable
+DROP_PENALTY = 10**9  # cost of leaving a stop unserved (milli-currency); only used when infeasible
+MAX_WAIT_MIN = 120
 
 
 @dataclass
 class Settings:
     vehicles: int = 4
     capacity: int = 40
-    speed_kmh: float = 30.0
+    speed_kmh: float = 30.0  # straight-line fallback only
+    traffic_factor: float = 1.3  # multiplies free-flow road drive times
     shift_start: int = 8 * 60  # minutes from midnight
     shift_minutes: int = 9 * 60
     use_time_windows: bool = True
     balance: bool = False
     time_limit_s: int = 5
+    cost_per_km: float = 0.30
+    cost_per_van: float = 80.0  # per van per day: driver + vehicle
 
 
 @dataclass
@@ -52,6 +60,10 @@ class Plan:
         return sum(len(r.nodes) for r in self.routes)
 
 
+def plan_cost(plan: Plan, s: Settings) -> float:
+    return plan.total_km * s.cost_per_km + len(plan.routes) * s.cost_per_van
+
+
 # ---------------------------------------------------------------- input
 
 
@@ -67,7 +79,7 @@ def _to_minutes(value, default: int) -> int:
 
 def load_stops(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
     """Normalize an uploaded table. Row flagged depot=1 (or the first row) becomes index 0."""
-    cols = {c.lower().strip(): c for c in df.columns}
+    cols = {str(c).lower().strip(): c for c in df.columns}
     missing = [c for c in ("lat", "lon") if c not in cols]
     if missing:
         raise ValueError(f"Missing column(s): {', '.join(missing)}. Required: name, lat, lon.")
@@ -79,6 +91,8 @@ def load_stops(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
     if out[["lat", "lon"]].isna().any().any():
         bad = out[out[["lat", "lon"]].isna().any(axis=1)].index.tolist()
         raise ValueError(f"Rows with invalid coordinates: {[i + 2 for i in bad]} (spreadsheet row numbers).")
+    if len(out) > 200:
+        raise ValueError("This demo handles up to 200 stops. Client versions handle thousands.")
 
     out["demand"] = pd.to_numeric(df[cols["demand"]], errors="coerce").fillna(1).astype(int) if "demand" in cols else 1
     out["service_min"] = (
@@ -112,28 +126,36 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def distance_matrix_m(stops: pd.DataFrame) -> list[list[int]]:
+def straight_line_matrices(stops: pd.DataFrame, speed_kmh: float) -> Matrices:
     pts = list(zip(stops.lat, stops.lon))
-    return [[int(haversine_km(*a, *b) * ROAD_FACTOR * 1000) for b in pts] for a in pts]
+    dist = [[int(haversine_km(*a, *b) * ROAD_FACTOR * 1000) for b in pts] for a in pts]
+    secs = [[int(d / 1000 / speed_kmh * 3600) for d in row] for row in dist]
+    return Matrices(dist, secs, "straight-line")
 
 
-def travel_minutes(dist_m: list[list[int]], speed_kmh: float) -> list[list[int]]:
-    return [[int(round(d / 1000 / speed_kmh * 60)) for d in row] for row in dist_m]
+def travel_minutes(mx: Matrices, s: Settings) -> list[list[int]]:
+    factor = s.traffic_factor if mx.source == "roads" else 1.0
+    return [[int(round(t * factor / 60)) for t in row] for row in mx.time_s]
 
 
 # ---------------------------------------------------------------- optimizer
 
 
-def solve(stops: pd.DataFrame, s: Settings) -> Plan:
+def solve(stops: pd.DataFrame, s: Settings, mx: Matrices) -> Plan:
     n = len(stops)
-    dist = distance_matrix_m(stops)
-    travel = travel_minutes(dist, s.speed_kmh)
+    dist = mx.dist_m
+    travel = travel_minutes(mx, s)
     service = stops.service_min.tolist()
     demand = stops.demand.tolist()
     day_end = s.shift_start + s.shift_minutes
+    per_m = max(s.cost_per_km, 0.01)  # milli-currency per meter == currency per km
+    arc_cost = [[int(d * per_m) for d in row] for row in dist]
 
     manager = pywrapcp.RoutingIndexManager(n, s.vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
+
+    def cost_cb(i, j):
+        return arc_cost[manager.IndexToNode(i)][manager.IndexToNode(j)]
 
     def dist_cb(i, j):
         return dist[manager.IndexToNode(i)][manager.IndexToNode(j)]
@@ -145,30 +167,29 @@ def solve(stops: pd.DataFrame, s: Settings) -> Plan:
     def demand_cb(i):
         return demand[manager.IndexToNode(i)]
 
-    dist_idx = routing.RegisterTransitCallback(dist_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
+    routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(cost_cb))
+    routing.SetFixedCostOfAllVehicles(int(s.cost_per_van * 1000))
 
     routing.AddDimensionWithVehicleCapacity(
         routing.RegisterUnaryTransitCallback(demand_cb), 0, [s.capacity] * s.vehicles, True, "Load"
     )
 
-    time_idx = routing.RegisterTransitCallback(time_cb)
-    routing.AddDimension(time_idx, 120, 24 * 60, False, "Time")  # up to 2h waiting at a stop
+    routing.AddDimension(routing.RegisterTransitCallback(time_cb), MAX_WAIT_MIN, 24 * 60, False, "Time")
     tdim = routing.GetDimensionOrDie("Time")
     for node in range(1, n):
         idx = manager.NodeToIndex(node)
         lo, hi = (int(stops.tw_start[node]), int(stops.tw_end[node])) if s.use_time_windows else (s.shift_start, day_end)
         lo, hi = max(lo, s.shift_start), max(min(hi, day_end), s.shift_start)
         tdim.CumulVar(idx).SetRange(min(lo, hi), hi)
-        routing.AddDisjunction([idx], DROP_PENALTY_M)
+        routing.AddDisjunction([idx], DROP_PENALTY)
     for v in range(s.vehicles):
         tdim.CumulVar(routing.Start(v)).SetRange(s.shift_start, day_end)
         tdim.CumulVar(routing.End(v)).SetRange(s.shift_start, day_end)
         routing.AddVariableMinimizedByFinalizer(tdim.CumulVar(routing.End(v)))
 
     if s.balance:
-        routing.AddDimension(dist_idx, 0, 10_000_000, True, "Distance")
-        routing.GetDimensionOrDie("Distance").SetGlobalSpanCostCoefficient(50)
+        routing.AddDimension(routing.RegisterTransitCallback(dist_cb), 0, 10**8, True, "Distance")
+        routing.GetDimensionOrDie("Distance").SetGlobalSpanCostCoefficient(max(1, int(50 * per_m)))
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -197,21 +218,31 @@ def solve(stops: pd.DataFrame, s: Settings) -> Plan:
                 load += demand[node]
         end = sol.Min(tdim.CumulVar(idx))
         if nodes:
-            routes.append(Route(v + 1, nodes, arrivals, meters / 1000, load, start, end))
+            routes.append(Route(len(routes) + 1, nodes, arrivals, meters / 1000, load, start, end))
             visited.update(nodes)
     dropped = [i for i in range(1, n) if i not in visited]
     return Plan(routes, dropped, sum(r.distance_km for r in routes), elapsed, "OK")
 
 
+def fleet_sweep(stops: pd.DataFrame, s: Settings, mx: Matrices, max_vans: int) -> pd.DataFrame:
+    """Solve once per fleet size: what does each extra van buy?"""
+    rows = []
+    for v in range(1, max_vans + 1):
+        p = solve(stops, replace(s, vehicles=v, time_limit_s=1), mx)
+        rows.append({"vans available": v, "vans used": len(p.routes), "customers served": p.served,
+                     "not served": len(p.dropped), "km": round(p.total_km, 1), "daily cost": round(plan_cost(p, s), 2)})
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------- baseline
 
 
-def greedy_baseline(stops: pd.DataFrame, s: Settings) -> Plan:
+def greedy_baseline(stops: pd.DataFrame, s: Settings, mx: Matrices) -> Plan:
     """Quick manual-style plan: fill one van at a time, always driving to the nearest
     stop that still fits. Like a human planner, it adds another van when stops are left."""
     n = len(stops)
-    dist = distance_matrix_m(stops)
-    travel = travel_minutes(dist, s.speed_kmh)
+    dist = mx.dist_m
+    travel = travel_minutes(mx, s)
     day_end = s.shift_start + s.shift_minutes
     left = set(range(1, n))
     routes: list[Route] = []
@@ -225,7 +256,7 @@ def greedy_baseline(stops: pd.DataFrame, s: Settings) -> Plan:
                 lo, hi = (stops.tw_start[j], stops.tw_end[j]) if s.use_time_windows else (s.shift_start, day_end)
                 begin = max(arrive, lo)
                 back = begin + stops.service_min[j] + travel[j][0]
-                waits_ok = not nodes or begin - arrive <= 120  # a van can leave the depot later
+                waits_ok = not nodes or begin - arrive <= MAX_WAIT_MIN  # a van can leave the depot later
                 if load + stops.demand[j] <= s.capacity and begin <= hi and waits_ok and back <= day_end:
                     best = (j, begin)
                     break
@@ -251,6 +282,21 @@ def greedy_baseline(stops: pd.DataFrame, s: Settings) -> Plan:
 
 def hhmm(minutes: int) -> str:
     return f"{int(minutes) // 60:02d}:{int(minutes) % 60:02d}"
+
+
+def maps_legs(stops: pd.DataFrame, route: Route, per_leg: int = 9) -> list[str]:
+    """Google Maps driving links for a route, split into legs of at most `per_leg` waypoints."""
+    pts = [(stops.lat[0], stops.lon[0])] + [(stops.lat[n], stops.lon[n]) for n in route.nodes] + [(stops.lat[0], stops.lon[0])]
+    links, i = [], 0
+    while i < len(pts) - 1:
+        chunk = pts[i : i + per_leg + 2]
+        fmt = lambda p: f"{p[0]:.5f},{p[1]:.5f}"  # noqa: E731
+        url = f"https://www.google.com/maps/dir/?api=1&travelmode=driving&origin={fmt(chunk[0])}&destination={fmt(chunk[-1])}"
+        if len(chunk) > 2:
+            url += "&waypoints=" + "%7C".join(fmt(p) for p in chunk[1:-1])
+        links.append(url)
+        i += len(chunk) - 1
+    return links
 
 
 def plan_table(stops: pd.DataFrame, plan: Plan) -> pd.DataFrame:

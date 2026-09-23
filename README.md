@@ -2,13 +2,17 @@
 
 **Live demo:** https://slimaneoptic-routes.streamlit.app
 
-Upload your delivery stops, set your fleet, and get the shortest routes that respect van capacity, delivery time windows and shift length. Each plan is compared with a quick manual plan built from the same data.
+Upload your delivery stops (CSV or Excel), set your fleet and your costs, and get the cheapest routes **on real roads** that respect van capacity, delivery time windows and shift length. Each plan is compared with a quick manual plan built from the same data, in km, vans and money.
 
 ![Route optimizer on the Dubai sample](docs/screenshot.png)
 
-On the included samples the optimized plan drives **14–36% fewer km** and often needs **one van less** than the nearest-next-stop manual plan, while serving every customer inside their window.
+On the included samples (real road distances, $0.30/km, $80 per van-day) the optimized plan costs **11–32% less per day** than the nearest-next-stop manual plan (about **$16k–31k a year**), drives 21–32% fewer km and often needs **one van less**, while serving every customer inside their window.
 
 ## What it handles
+- **Real road distances and drive times** (OpenStreetMap / OSRM) with a traffic factor; routes drawn along the roads
+- **Cost objective:** cost per km + daily cost per van, so it decides whether one more van pays off
+- **Fleet sizing:** solves 1, 2, 3… vans to show the smallest fleet that serves everyone
+- **Driver sheets:** Excel workbook with one sheet per van, arrival times, map links and Google Maps navigation
 
 - Vehicle capacities (units, kg, pallets)
 - Delivery time windows per customer (`HH:MM`)
@@ -31,7 +35,7 @@ On the included samples the optimized plan drives **14–36% fewer km** and ofte
 
 ## How it works
 
-Google OR-Tools routing solver (guided local search) with capacity and time dimensions. In the demo, distances are straight-line × 1.3. Production versions use real road distances and travel times (OSRM or Google Maps).
+Google OR-Tools routing solver (guided local search) with capacity and time dimensions, minimizing daily cost. Road distances and times come from OSRM (OpenStreetMap); the 3 sample cities ship with precomputed road matrices, and uploads query OSRM live with a straight-line fallback.
 
 ## Run locally
 
