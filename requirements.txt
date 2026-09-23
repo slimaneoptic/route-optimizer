@@ -1,0 +1,5 @@
+ortools>=9.11
+streamlit>=1.50
+pandas>=2.0
+folium>=0.17
+streamlit-folium>=0.22
