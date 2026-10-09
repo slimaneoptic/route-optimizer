@@ -1,6 +1,12 @@
 # Route optimizer
 
-**Live demo:** https://slimaneoptic-routes.streamlit.app
+11-32% lower daily cost than a manual plan on the sample cities.
+
+**Live demo:** https://slimanechanchoul.com/routes/ · Streamlit app (may take a minute to wake): https://slimaneoptic-routes.streamlit.app
+
+Demo on sample data.
+
+Tests: `pytest -q tests`
 
 Upload your delivery stops (CSV or Excel), set your fleet and your costs, and get the cheapest routes **on real roads** that respect van capacity, delivery time windows and shift length. Each plan is compared with a quick manual plan built from the same data, in km, vans and money.
 
