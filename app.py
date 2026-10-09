@@ -13,7 +13,7 @@ from export import workbook
 from roads import cached_sample, osrm_table, route_shape
 from solver import Settings, fleet_sweep, greedy_baseline, hhmm, load_stops, maps_legs, plan_cost, plan_table, solve, straight_line_matrices
 
-AUTHOR = "Slimane"
+AUTHOR = "S'limane"
 HIRE_URL = "https://www.upwork.com/freelancers/~01d6ae0f1a06a43ac0"
 
 DATA = Path(__file__).parent / "data"
